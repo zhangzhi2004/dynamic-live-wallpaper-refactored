@@ -3,7 +3,7 @@
 // 做四件事：
 //   1. 把一个无边框窗口挂到桌面图标下面（壁纸层），里面用 WebView2 显示当前主题的页面（如 prototype/flat.html?wallpaper=1）
 //   0. 设置窗口（prototype/settings.html）：选主题、调参数，实时同步到壁纸并保存到 settings.json；一键分享（壁纸页面画一张打好马赛克的桌面图）
-//   2. 每 400ms 读取桌面图标的真实位置（桌面 ListView 的跨进程消息），有变化才发给页面
+//   2. 从桌面 ListView 读取真实图标位置。优先处理布局通知，定时轮询作补充
 //   3. 前台窗口最大化 / 全屏时暂停动画；托盘图标可以暂停、重新载入、退出（退出后恢复原壁纸）
 //   4. 资源管理器重建壁纸层时（例如按 Win+D），我们的窗口会被连带销毁 → 自动重新挂载
 //
@@ -460,7 +460,7 @@ class HostContext : ApplicationContext
 
     bool ThemeAllowed(string id)
     {
-        return Themes.Allowed(pageDir, id, delegate(string product) { return false; });
+        return Themes.Available(pageDir, id);
     }
 
     // 设置页发来的消息：hello / set / reset / theme / autostart / lang / updateProgram
@@ -507,7 +507,7 @@ class HostContext : ApplicationContext
                 if (id == null || !ThemeAllowed(id))
                 {
                     settingsWin.Post(Json.Stringify(Json.Obj("t", "themeChanged", "id", Settings.Theme)));
-                    Log.Write("拒绝未授权或未知主题切换：" + (id ?? "null"));
+                    Log.Write("拒绝不存在或无法加载的主题：" + (id ?? "null"));
                     return;
                 }
                 string page = Themes.PageFor(pageDir, id);
@@ -608,9 +608,14 @@ class HostContext : ApplicationContext
         {
             int comma = video.IndexOf(',');
             byte[] bytes = Convert.FromBase64String(comma >= 0 ? video.Substring(comma + 1) : video);
+            bool webm = mime == "video/webm";
+            bool validVideo = bytes.Length >= 12 && (webm
+                ? bytes[0] == 0x1a && bytes[1] == 0x45 && bytes[2] == 0xdf && bytes[3] == 0xa3
+                : mime == "video/mp4" && Encoding.ASCII.GetString(bytes, 4, 4) == "ftyp");
+            if (!validVideo) throw new InvalidDataException(I18n.T("errBadData"));
             string dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyPictures), "Deskland Preview");
             Directory.CreateDirectory(dir);
-            string name = "Deskland " + DateTime.Now.ToString("yyyy-MM-dd HHmmss") + (mime == "video/webm" ? ".webm" : ".mp4");
+            string name = "Deskland " + DateTime.Now.ToString("yyyy-MM-dd HHmmss") + (webm ? ".webm" : ".mp4");
             string path = Path.Combine(dir, name);
             File.WriteAllBytes(path, bytes);
             lastShare = path;
@@ -773,7 +778,7 @@ class HostContext : ApplicationContext
         string page = ThemeAllowed(Settings.Theme) ? Themes.PageFor(pageDir, Settings.Theme) : null;
         if (page == null)
         {
-            Log.Write("没有可加载的已授权主题，5 秒后重试");
+            Log.Write("没有可加载的本地主题，5 秒后重试");
             nextStart = DateTime.Now.AddSeconds(5);
             return;
         }
@@ -904,7 +909,7 @@ class SettingsForm : Form
         Icon = AppIcon.Create();
         StartPosition = FormStartPosition.CenterScreen;
         float s = Native.GetDpiForSystem() / 96f;       // 进程按物理像素工作，窗口尺寸要自己按缩放比例算
-        ClientSize = new Size((int)(1120 * s), (int)(800 * s));     // 左边主题排三列，右边上面预览、下面参数
+        ClientSize = new Size((int)(1120 * s), (int)(800 * s));     // 左侧主题与实时风景，右侧元素 / 环境调节栏
         MinimumSize = new Size((int)(940 * s), (int)(680 * s));
         BackColor = Color.White;
 
@@ -988,7 +993,7 @@ class SettingsForm : Form
 class WallpaperForm : Form
 {
     readonly WebView2 web;
-    readonly System.Windows.Forms.Timer iconTimer, fgTimer;
+    readonly System.Windows.Forms.Timer iconTimer, iconChangeTimer, fgTimer;
     readonly string pageDir;
     readonly IconReader reader = new IconReader();
     Rectangle screen;
@@ -1024,8 +1029,11 @@ class WallpaperForm : Form
         Controls.Add(web);
 
         iconTimer = new System.Windows.Forms.Timer();
-        iconTimer.Interval = 400;
+        iconTimer.Interval = 220;
         iconTimer.Tick += delegate { PollIcons(); };
+        iconChangeTimer = new System.Windows.Forms.Timer();
+        iconChangeTimer.Interval = 32;
+        iconChangeTimer.Tick += delegate { PollIcons(); };
         fgTimer = new System.Windows.Forms.Timer();
         fgTimer.Interval = 500;
         fgTimer.Tick += delegate { PollForeground(); };
@@ -1074,7 +1082,7 @@ class WallpaperForm : Form
         if (recordDone != null) { done(null, null, null, I18n.T("errBusyVideo")); return; }
         recordDone = done;
         recordTimeout = new System.Windows.Forms.Timer();
-        recordTimeout.Interval = 45000;
+        recordTimeout.Interval = 55000;
         recordTimeout.Tick += delegate { FinishRecord(null, null, null, I18n.T("errVideoTimeout")); };
         recordTimeout.Start();
         try { web.CoreWebView2.PostWebMessageAsString("{\"t\":\"record\"}"); }
@@ -1195,7 +1203,7 @@ class WallpaperForm : Form
     public static string AttachMode = "progman";
     bool raised;
     IntPtr zAnchor;                                     // 我们要紧跟在它下面的窗口（图标列表 / 图标层）
-    IntPtr winEventHook;
+    IntPtr winEventHook, iconLocationHook;
     Native.WinEventDelegate winEventProc;               // 保持引用，防止被 GC
 
     static IntPtr FindClassicWorker()
@@ -1278,17 +1286,23 @@ class WallpaperForm : Form
             Native.SWP_NOACTIVATE | Native.SWP_SHOWWINDOW | Native.SWP_FRAMECHANGED);
         EnsureZOrder();
 
-        if (raised)
+        uint explorerPid;
+        Native.GetWindowThreadProcessId(progman, out explorerPid);
+        if (explorerPid != 0)
         {
-            // 资源管理器新建 / 重排壁纸层时立刻修正顺序（换壁纸时它会把新的 WorkerW 插到我们上面）
-            uint pid;
-            Native.GetWindowThreadProcessId(progman, out pid);
             winEventProc = delegate(IntPtr hook, uint ev, IntPtr hwnd, int idObject, int idChild, uint thread, uint time)
             {
-                if (idObject == 0 && !shuttingDown && IsHandleCreated) EnsureZOrder();
+                if (shuttingDown || !IsHandleCreated) return;
+                // Explorer can insert its wallpaper layer above ours after a reorder.
+                if (raised && ev <= Native.EVENT_OBJECT_REORDER && idObject == 0) EnsureZOrder();
+                // A drag or layout operation can emit many events before it settles.
+                if (hwnd != IntPtr.Zero && hwnd == reader.ListWindow && !iconChangeTimer.Enabled)
+                    iconChangeTimer.Start();
             };
-            winEventHook = Native.SetWinEventHook(0x8000 /* OBJECT_CREATE */, 0x8004 /* OBJECT_REORDER */, IntPtr.Zero,
-                winEventProc, pid, 0, 0 /* WINEVENT_OUTOFCONTEXT */);
+            winEventHook = Native.SetWinEventHook(Native.EVENT_OBJECT_CREATE, Native.EVENT_OBJECT_REORDER, IntPtr.Zero,
+                winEventProc, explorerPid, 0, 0 /* WINEVENT_OUTOFCONTEXT */);
+            iconLocationHook = Native.SetWinEventHook(Native.EVENT_OBJECT_LOCATIONCHANGE, Native.EVENT_OBJECT_NAMECHANGE, IntPtr.Zero,
+                winEventProc, explorerPid, 0, 0);
         }
         Log.Write(string.Format("已挂载（{0}），屏幕 {1}", mode, screen));
         return true;
@@ -1323,6 +1337,8 @@ class WallpaperForm : Form
     // ---------------------------------------------------------------- 读取桌面图标
     void PollIcons()
     {
+        iconChangeTimer.Stop();
+        if (shuttingDown) return;
         EnsureZOrder();
         if (web.CoreWebView2 == null) return;
         bool visible;
@@ -1381,7 +1397,7 @@ class WallpaperForm : Form
     {
         if (shuttingDown) return;
         shuttingDown = true;
-        iconTimer.Stop(); fgTimer.Stop();
+        iconTimer.Stop(); iconChangeTimer.Stop(); fgTimer.Stop();
         reader.Dispose();
         IntPtr parent = parentHwnd;
         try { web.Dispose(); } catch { }
@@ -1395,7 +1411,8 @@ class WallpaperForm : Form
     protected override void OnHandleDestroyed(EventArgs e)
     {
         if (winEventHook != IntPtr.Zero) { Native.UnhookWinEvent(winEventHook); winEventHook = IntPtr.Zero; }
-        iconTimer.Stop(); fgTimer.Stop();
+        if (iconLocationHook != IntPtr.Zero) { Native.UnhookWinEvent(iconLocationHook); iconLocationHook = IntPtr.Zero; }
+        iconTimer.Stop(); iconChangeTimer.Stop(); fgTimer.Stop();
         reader.Dispose();
         base.OnHandleDestroyed(e);
     }
@@ -1404,7 +1421,18 @@ class WallpaperForm : Form
 // 通过桌面 ListView 的跨进程消息读取图标矩形（图标 + 文字，物理像素，屏幕坐标）
 class IconReader : IDisposable
 {
+    const uint ListViewTimeout = 100;
     IntPtr listView, proc, mem;
+    string lastError;
+    int lastCount = -1;
+    public IntPtr ListWindow { get { return listView; } }
+
+    bool Failed(string reason)
+    {
+        if (lastError != reason) Log.Write("无法读取桌面图标位置：" + reason);
+        lastError = reason;
+        return false;
+    }
 
     static IntPtr FindListView()
     {
@@ -1427,13 +1455,15 @@ class IconReader : IDisposable
     {
         Close();
         listView = FindListView();
-        if (listView == IntPtr.Zero) return false;
+        if (listView == IntPtr.Zero) return Failed("桌面图标视图尚未就绪");
         uint pid;
         Native.GetWindowThreadProcessId(listView, out pid);
         proc = Native.OpenProcess(0x0008 | 0x0010 | 0x0020, false, pid);   // VM_OPERATION | VM_READ | VM_WRITE
-        if (proc == IntPtr.Zero) return false;
+        if (proc == IntPtr.Zero) return Failed("资源管理器进程访问失败，系统错误 " + Marshal.GetLastWin32Error());
         mem = Native.VirtualAllocEx(proc, IntPtr.Zero, new IntPtr(64), 0x1000 | 0x2000, 0x04);
-        return mem != IntPtr.Zero;
+        if (mem == IntPtr.Zero) return Failed("无法分配图标坐标缓冲区");
+        lastError = null;
+        return true;
     }
 
     public List<Native.RECT> Read(out bool visible)
@@ -1443,7 +1473,11 @@ class IconReader : IDisposable
         visible = Native.IsWindowVisible(listView);
         var result = new List<Native.RECT>();
         if (!visible) return result;                   // 用户隐藏了桌面图标 → 全是海
-        int count = (int)Native.SendMessage(listView, 0x1004 /* LVM_GETITEMCOUNT */, IntPtr.Zero, IntPtr.Zero);
+        IntPtr response;
+        if (Native.SendMessageTimeout(listView, 0x1004 /* LVM_GETITEMCOUNT */, IntPtr.Zero, IntPtr.Zero,
+            Native.SMTO_ABORTIFHUNG, ListViewTimeout, out response) == IntPtr.Zero) return null;
+        int count = response.ToInt32();
+        if (count != lastCount) { Log.Write("桌面图标位置已连接：" + count + " 个图标"); lastCount = count; }
         var origin = new Native.POINT();
         Native.ClientToScreen(listView, ref origin);
         for (int i = 0; i < count; i++)
@@ -1451,7 +1485,8 @@ class IconReader : IDisposable
             var r = new Native.RECT();                 // Left = LVIR_BOUNDS（0）：图标 + 文字的整体范围
             IntPtr n;
             if (!Native.WriteProcessMemory(proc, mem, ref r, 16, out n)) { Close(); return null; }
-            Native.SendMessage(listView, 0x100E /* LVM_GETITEMRECT */, new IntPtr(i), mem);
+            if (Native.SendMessage(listView, 0x100E /* LVM_GETITEMRECT */, new IntPtr(i), mem) == IntPtr.Zero)
+                return null; // Layout changed during the read. Retry the entire batch.
             if (!Native.ReadProcessMemory(proc, mem, out r, 16, out n)) { Close(); return null; }
             r.Left += origin.X; r.Right += origin.X; r.Top += origin.Y; r.Bottom += origin.Y;
             result.Add(r);
@@ -1464,6 +1499,7 @@ class IconReader : IDisposable
         if (mem != IntPtr.Zero && proc != IntPtr.Zero) Native.VirtualFreeEx(proc, mem, IntPtr.Zero, 0x8000);
         if (proc != IntPtr.Zero) Native.CloseHandle(proc);
         mem = proc = IntPtr.Zero;
+        listView = IntPtr.Zero;
     }
 
     public void Dispose() { Close(); }
@@ -1475,6 +1511,9 @@ static class Native
     public const uint LWA_ALPHA = 0x2, SWP_NOSIZE = 0x0001, SWP_NOMOVE = 0x0002;
     public const uint MOD_ALT = 0x1, MOD_CONTROL = 0x2, MOD_NOREPEAT = 0x4000;
     public const int SW_SHOW = 5, SW_RESTORE = 9;
+    public const uint EVENT_OBJECT_CREATE = 0x8000, EVENT_OBJECT_REORDER = 0x8004;
+    public const uint EVENT_OBJECT_LOCATIONCHANGE = 0x800B, EVENT_OBJECT_NAMECHANGE = 0x800C;
+    public const uint SMTO_ABORTIFHUNG = 0x0002;
     [DllImport("user32.dll")] public static extern bool RegisterHotKey(IntPtr h, int id, uint modifiers, uint vk);
     [DllImport("dwmapi.dll")] public static extern int DwmSetWindowAttribute(IntPtr h, int attr, ref int val, int size);
     [DllImport("user32.dll")] public static extern bool UnregisterHotKey(IntPtr h, int id);
@@ -1518,7 +1557,7 @@ static class Native
     [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
     [DllImport("user32.dll")] public static extern bool RedrawWindow(IntPtr h, IntPtr rect, IntPtr rgn, uint flags);
     [DllImport("dwmapi.dll")] public static extern int DwmGetWindowAttribute(IntPtr h, int attribute, out int value, int size);
-    [DllImport("kernel32.dll")] public static extern IntPtr OpenProcess(uint access, bool inherit, uint pid);
+    [DllImport("kernel32.dll", SetLastError = true)] public static extern IntPtr OpenProcess(uint access, bool inherit, uint pid);
     [DllImport("kernel32.dll")] public static extern bool CloseHandle(IntPtr h);
     [DllImport("kernel32.dll")] public static extern IntPtr VirtualAllocEx(IntPtr proc, IntPtr addr, IntPtr size, uint type, uint protect);
     [DllImport("kernel32.dll")] public static extern bool VirtualFreeEx(IntPtr proc, IntPtr addr, IntPtr size, uint type);
@@ -1529,7 +1568,16 @@ static class Native
 // Deskland Preview has its own data and instance identity; isolated profiles support installation QA.
 static class InstallProfile
 {
-    public static readonly string Override = Environment.GetEnvironmentVariable("DESKLAND_PROFILE_DIR");
+    public static readonly string Override = FindOverride();
+    static string FindOverride()
+    {
+        string configured = Environment.GetEnvironmentVariable("DESKLAND_PROFILE_DIR");
+        if (!string.IsNullOrEmpty(configured)) return configured;
+        string marker = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Deskland.profile");
+        if (!File.Exists(marker)) return null;
+        string relative = File.ReadAllText(marker, Encoding.UTF8).Trim();
+        return relative.Length == 0 ? null : Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, relative));
+    }
     public static readonly bool Isolated = !string.IsNullOrEmpty(Override);
     public static readonly string DataDir = Isolated ? Path.GetFullPath(Override) : Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "DesklandPreview");

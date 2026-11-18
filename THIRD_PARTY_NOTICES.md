@@ -12,6 +12,10 @@ WebView2 及 Windows / .NET Framework 组件适用各自的许可条款，不因
 
 The host uses the Microsoft Edge WebView2 SDK and Runtime. SDK binaries are downloaded by the build script and are not checked into this repository. Microsoft components retain their respective licenses.
 
+## Mediabunny
+
+The local video exporter contains Mediabunny 1.66.0 by Vanilagy and contributors, under MPL-2.0. The corresponding unmodified library source and license are available at https://github.com/Vanilagy/mediabunny/tree/v1.66.0 and in the pinned npm package (https://www.npmjs.com/package/mediabunny/v/1.66.0). Rebuild the browser bundle with `npm ci` and `npm run build:video`.
+
 ## NSIS
 
 Windows 安装包使用 NSIS 3.13 制作。便携编译器仅在构建时下载，不作为项目源码提交。NSIS 及其压缩模块适用各自许可，详见 https://nsis.sourceforge.io/License 。安装包附带项目对应源码 ZIP。

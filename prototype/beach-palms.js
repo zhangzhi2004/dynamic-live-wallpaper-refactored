@@ -18,11 +18,15 @@ uniform float uPalmMirror;
 uniform float uTime;
 out vec2 palmUV;
 void main() {
-  vec2 corner = vec2(float(gl_VertexID & 1), float(gl_VertexID >> 1));
+  const float rows[4] = float[](0.0, 0.38, 162.0 / 256.0, 1.0);
+  vec2 corner = vec2(float(gl_VertexID & 1), rows[gl_VertexID >> 1]);
   vec2 local = corner * vec2(224.0, 256.0) - vec2(112.0, 162.0);
   local.x *= uPalmMirror;
-  float a = sin(uTime * .65 + uPalm.w * 2.0) * .008;
-  local = mat2(cos(a), sin(a), -sin(a), cos(a)) * local;
+  // Only the upper trunk and fronds flex. The trunk's foot and the soft
+  // shadow built into the atlas stay pinned to the beach.
+  float flex = smoothstep(14.0, 120.0, -local.y);
+  float gust = sin(uTime * .80 - dot(uPalm.xy, vec2(.008, .004))) * 2.45;
+  local.x += flex * (gust + sin(uTime * 1.67 + uPalm.w) * .52);
   vec2 p = uPalm.xy + local * uPalm.z;
   gl_Position = vec4(p.x / uRes.x * 2.0 - 1.0, 1.0 - p.y / uRes.y * 2.0, 0.0, 1.0);
   palmUV = vec2((corner.x + uPalm.w) / ${BEACH_PALM_STYLES.length}.0, corner.y);
@@ -42,7 +46,7 @@ void main() {
     if (dot(q, q) < 400.0) {vec3 bird = gullSD(q, b.w);if (min(bird.x, bird.y) < .6) discard;}
   }
   float alpha = tree.a * uPalmOpacity;
-  o = vec4(tree.rgb * alpha, alpha);
+  o = vec4(beachLight(tree.rgb) * alpha, alpha);
 }`;
 
 function makeMaldivesPalmAtlas() {
@@ -134,6 +138,15 @@ function drawMaldivesPalms(now, pass, configurePass, context) {
     if (layoutChanged || !scene.placements) scene.placements = count ? chooseMaldivesPalms() : null;
     if (count && !scene.placements) scene.placements = chooseMaldivesPalms();
     const next = (scene.placements || []).slice(0, count);
+    scene.footprints = next.flatMap(palm => {
+      const style = BEACH_PALM_STYLES[palm.variant];
+      return [
+        { x: palm.x, y: palm.y, radius: 8 * palm.scale },
+        { x: palm.x + style.crown[0] * palm.scale * palm.mirror,
+          y: palm.y + style.crown[1] * palm.scale,
+          radius: style.radius * palm.scale * 0.63 },
+      ];
+    });
     for (const old of scene.palms) old.retiring = true;
     for (const p of next) {
       const old = scene.palms.find(q => Math.hypot(q.x - p.x, q.y - p.y) < 26 && Math.abs(q.scale - p.scale) < .02);
@@ -152,7 +165,7 @@ function drawMaldivesPalms(now, pass, configurePass, context) {
     if (palm.opacity < .003) continue;
     gl.uniform4f(pass.U.uPalm, palm.x, palm.y, palm.scale, palm.variant);gl.uniform1f(pass.U.uPalmOpacity, palm.opacity);
     gl.uniform1f(pass.U.uPalmMirror, palm.mirror);
-    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 8);
   }
   scene.palms = scene.palms.filter(p => !p.retiring || p.opacity > .003);
   gl.disable(gl.BLEND);

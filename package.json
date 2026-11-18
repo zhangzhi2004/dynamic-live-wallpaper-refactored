@@ -1,0 +1,17 @@
+{
+  "name": "deskland-local-themes",
+  "private": true,
+  "version": "0.3.7",
+  "type": "module",
+  "scripts": {
+    "preview": "node prototype/serve.mjs",
+    "test": "node tests/browser.mjs",
+    "test:catalog": "powershell -NoProfile -ExecutionPolicy Bypass -File tools/test-catalog.ps1",
+    "build:video": "esbuild tools/video-export.mjs --bundle --minify --format=esm --legal-comments=inline --outfile=prototype/video-export.mjs"
+  },
+  "devDependencies": {
+    "esbuild": "0.27.7",
+    "mediabunny": "1.66.0",
+    "playwright": "1.65.1"
+  }
+}

@@ -143,6 +143,9 @@
 </aside>
 <div id="nogl">当前浏览器不支持 WebGL2，无法运行原型。</div>
 
+<script src="elements/scene-art.js?v=0.3.7"></script>
+<script src="elements/scene-elements.js?v=0.3.7"></script>
+<script src="terrain-field.js?v=0.3.7"></script>
 <script>
 'use strict';
 
@@ -151,7 +154,7 @@
    ====================================================================== */
 const CELL_W = 76, CELL_H = 100, GRID_X0 = 4, GRID_Y0 = 6, TASKBAR = 48;
 const STEP = 5;
-const MORPH_MS = 1800;
+const MORPH_MS = 620, INTRO_MS = 900;
 
 const QS = new URLSearchParams(location.search);
 const WALL = QS.has('wallpaper');      // 壁纸模式：桌面宿主加载，消息来自宿主
@@ -160,15 +163,17 @@ const PREVIEW = QS.has('preview');     // 预览模式：设置窗口里的缩�
 const P = {
   sigma: 72, warp: 40, edge: 10, cover: 0.3, flow: 1, grain: 1, quality: 2,   // quality 2：按屏幕的实际像素画（150% 缩放时不再放大发糊）
   debug: false, snap: true, cap30: true,
-  showBoy: 1, showCat: 1, adaptive: 1,
+  showBoy: 1, showCat: 1, adaptive: 1, lighting: 0,
 };
+Object.assign(P, SceneElements.defaults('meadow'));
 const DEFAULTS = Object.assign({}, P);
-const DISPLAY_KEYS = ['showBoy', 'showCat', 'adaptive'];
+const DISPLAY_KEYS = ['showBoy', 'showCat', 'adaptive', 'lighting'];
 const SLIDERS = [
   { key: 'sigma',  label: '云团大小', min: 40,  max: 200, step: 1,    fmt: v => v + ' px', act: 'field' },
   { key: 'cover',  label: '草地上的云', min: 0,   max: 1,   step: 0.01, fmt: v => Math.round(v * 100) + '%' },
   { key: 'flow',   label: '流动速度', min: 0,   max: 3,   step: 0.05, fmt: v => '×' + v.toFixed(2) },
 ];
+SLIDERS.push(...SceneElements.sliders('meadow'));
 
 /* ======================================================================
    图标与布局数据
@@ -283,43 +288,23 @@ function makeNoiseImage() {
 /* ======================================================================
    陆地场（CPU）：s = 到海岸的有符号距离（<0 陆地）
    ====================================================================== */
-let W = innerWidth, H = innerHeight, Gw = 1, Gh = 1, NZ = null;
+let W = innerWidth, H = innerHeight, Gw = 1, Gh = 1, terrain;
 function buildNoise() {
   const N = Gw * Gh;
-  NZ = { wx: new Float32Array(N), wy: new Float32Array(N) };
+  const noise = { wx: new Float32Array(N), wy: new Float32Array(N) };
   for (let gy = 0; gy < Gh; gy++) for (let gx = 0; gx < Gw; gx++) {
     const i = gy * Gw + gx, x = gx * STEP, y = gy * STEP;
-    NZ.wx[i] = fbm(x * 0.0028, y * 0.0028, 1) - 0.47;
-    NZ.wy[i] = fbm(x * 0.0028, y * 0.0028, 2) - 0.47;
+    noise.wx[i] = fbm(x * 0.0028, y * 0.0028, 1) - 0.47;
+    noise.wy[i] = fbm(x * 0.0028, y * 0.0028, 2) - 0.47;
   }
+  terrain = createTerrainField(Gw, Gh, STEP, noise);
 }
 let fieldMs = 0;
 function computeField(rects) {
   const t0 = performance.now();
-  const N = Gw * Gh, f1 = new Float32Array(N);
-  const sig = P.sigma, is1 = 1 / (sig * sig);
-  const wa = P.warp * 2.2, wmax = wa * 0.5;
-  for (const r of rects) {
-    const R = 5.5 * sig + Math.max(r.hw, r.hh) * 0.5 + wmax;
-    const gx0 = Math.max(0, Math.floor((r.cx - R) / STEP)), gx1 = Math.min(Gw - 1, Math.ceil((r.cx + R) / STEP));
-    const gy0 = Math.max(0, Math.floor((r.cy - R) / STEP)), gy1 = Math.min(Gh - 1, Math.ceil((r.cy + R) / STEP));
-    const chw = r.hw * 0.5, chh = r.hh * 0.5;
-    for (let gy = gy0; gy <= gy1; gy++) for (let gx = gx0; gx <= gx1; gx++) {
-      const i = gy * Gw + gx;
-      const qx = gx * STEP + NZ.wx[i] * wa, qy = gy * STEP + NZ.wy[i] * wa;
-      let dx = Math.abs(qx - r.cx) - chw, dy = Math.abs(qy - r.cy) - chh;
-      if (dx < 0) dx = 0; if (dy < 0) dy = 0;
-      f1[i] += Math.exp(-(dx * dx + dy * dy) * is1);
-    }
-  }
-  // 下限 = 计算范围边缘处的贡献值：范围内外算出的"离岸距离"一致，深海不会出现方框状的接缝
-  const c0 = Math.sqrt(-Math.log(0.35)), s = new Float32Array(N), fMin = Math.exp(-30);
-  for (let i = 0; i < N; i++) {
-    const g = Math.log(Math.max(f1[i], fMin));
-    s[i] = sig * (Math.sqrt(Math.max(-g, 0)) - c0) - sig * 0.6 * Math.max(g, 0);
-  }
+  const result = terrain.compute(rects, P.sigma, P.warp);
   fieldMs = performance.now() - t0;
-  return { s };
+  return result;
 }
 function sampleArr(a, x, y) {
   const fx = Math.min(Math.max(x / STEP, 0), Gw - 1.001), fy = Math.min(Math.max(y / STEP, 0), Gh - 1.001);
@@ -338,9 +323,10 @@ void main() {
 
 const FS = `#version 300 es
 precision highp float;
-uniform sampler2D uNoise, uFA, uFB;
+uniform sampler2D uNoise, uFA, uFB, uExtras;
 uniform vec2 uRes, uGrid;
 uniform float uScale, uSeed, uStep, uMix, uTime, uDebug, uEdge;
+uniform vec2 uLighting; // dusk, night
 #ifdef MEADOW_ACTOR
 uniform sampler2D uActor, uActorShadow;
 uniform vec4 uActorRect;
@@ -356,16 +342,16 @@ uniform vec2 uCGrid;             // 格子数
 uniform float uCellG;            // 格子大小（px）
 out vec4 o;
 
-// ---- 调色板 ----
-const vec3 G_LIGHT = vec3(0.76, 0.83, 0.52), G_MID = vec3(0.62, 0.75, 0.42);  // 草地：浅的黄绿 / 绿（大块水彩晕染）
-const vec3 G_DEEP = vec3(0.52, 0.68, 0.36);                                   // 草地里颜色深一点的几片
-const vec3 INK = vec3(0.24, 0.38, 0.18);                                      // 画草的墨绿短线
-const vec3 SHADOW = vec3(0.56, 0.66, 0.52);                                   // 云影：把草地压成深绿
-const vec3 CLOUD_HI = vec3(1.0, 1.0, 0.99);                                   // 云：朝光外沿的亮白
-const vec3 CLOUD_BODY = vec3(0.90, 0.93, 0.96), CLOUD_SH = vec3(0.80, 0.85, 0.90); // 云：主体 / 偏暗的圆（比大海主题少一些蓝；主体不能太白，白色的图标文字要看得清）
+// ---- Sunlit sage, warm paper and cool cloud shade ----
+const vec3 G_LIGHT = vec3(0.75, 0.81, 0.56), G_MID = vec3(0.55, 0.69, 0.43);
+const vec3 G_DEEP = vec3(0.39, 0.58, 0.39);
+const vec3 INK = vec3(0.29, 0.45, 0.26);
+const vec3 SHADOW = vec3(0.63, 0.73, 0.66);
+const vec3 CLOUD_HI = vec3(1.0, 0.995, 0.96);
+const vec3 CLOUD_BODY = vec3(0.92, 0.95, 0.94), CLOUD_SH = vec3(0.76, 0.83, 0.84);
 const vec2 LIGHT = vec2(-0.6, -0.8);                                          // 太阳在左上方
 const vec2 SHADOW_OFF = vec2(115.0, 156.0);                                    // 云影落在右下方，离云远 → 云飘得高
-const int CIRC_K = 36;
+const int CIRC_K = 48;
 
 float hash2(vec2 p) {
   vec3 p3 = fract(vec3(p.xyx) * 0.1031);
@@ -378,10 +364,13 @@ float fieldS(sampler2D t, vec2 p) { return texture(t, (p / uStep + 0.5) / uGrid)
 float smin(float a, float b, float k) { float h = clamp(0.5 + 0.5 * (b - a) / k, 0.0, 1.0); return mix(b, a, h) - k * h * (1.0 - h); }
 
 // 到云的距离（<0 在云里）：图标周围云团的主体 + 自己格子里的圆（和天空主题同一套）
-// front = true 时顺便找出盖住这个点、圆心最靠下（最前面）的那个圆：fc = (圆心 x, y, 半径, 色调)
-float cloudDist(vec2 q, bool front, inout vec4 fc) {
+// Grab the two frontmost lobes to soften their seams without changing the
+// silhouettes used to wrap desktop icons.
+float cloudDist(vec2 q, bool surface, out vec4 front, out vec4 back) {
+  front = back = vec4(0.0, -1e9, 0.0, 0.0);
   float sF = mix(fieldS(uFA, q), fieldS(uFB, q), uMix);
   float d = sF - uEdge + 0.6 * 95.0;                                              // 主体：把圆之间的缝填上
+  if (!surface && d < -18.0) return d;
   ivec2 cell = ivec2(floor(q / uCellG)) + 4;                                      // 格子比屏幕左、上多 4 格（右下方的云影要用到），右、下多 3 格
   if (cell.x < 0 || cell.y < 0 || float(cell.x) >= uCGrid.x || float(cell.y) >= uCGrid.y) return d;
   for (int k = 0; k < CIRC_K; k++) {
@@ -389,33 +378,70 @@ float cloudDist(vec2 q, bool front, inout vec4 fc) {
     if (c.z <= 0.0) break;
     float di = length(q - c.xy) - c.z;
     d = smin(d, di, 6.0);
-    if (front && di < 0.0 && c.y > fc.y) fc = c;
+    if (!surface && d < -18.0) break;
+    if (surface && di < 0.0) {
+      if (c.y > front.y) { back = front; front = c; }
+      else if (c.y > back.y) back = c;
+    }
   }
   return d;
 }
-float cloudDist(vec2 q) { vec4 fc = vec4(0.0, -1e9, 0.0, 0.0); return cloudDist(q, false, fc); }
+float cloudDist(vec2 q) { vec4 front, back; return cloudDist(q, false, front, back); }
+
+vec3 cloudPaint(vec4 puff, vec2 p, vec2 edgeLight) {
+  vec2 q = (p - puff.xy) / max(puff.z, 1.0);
+  float z = sqrt(max(0.0, 1.0 - dot(q, q)));
+  float illumination = clamp(dot(vec3(q, z), vec3(edgeLight * 0.54, 0.84)), 0.0, 1.0);
+  vec3 wash = mix(CLOUD_SH, CLOUD_BODY, ss(0.01, 0.93, illumination) * 0.63 + 0.25);
+  wash *= 1.0 - 0.041 * puff.w;
+  return mix(wash, CLOUD_HI, illumination * 0.17);
+}
 
 // 到一段线的距离
 float segD(vec2 p, vec2 a, vec2 b) { vec2 pa = p - a, ba = b - a; return length(pa - ba * clamp(dot(pa, ba) / dot(ba, ba), 0.0, 1.0)); }
 
-// 画草的短线：每个 12×6 的格子里最多一笔，方向跟着大片区域走（一片片平行的排线），疏密也跟着区域变（有的地方密、有的地方空）
-// 只看自己的格子和上下两格（一笔不会伸出左右的格子）
-float grassInk(vec2 p) {
-  const vec2 G = vec2(12.0, 6.0);
+vec3 meadowNight(vec3 rgb) {
+  float luma = dot(rgb, vec3(0.26, 0.63, 0.11));
+  vec3 night = mix(vec3(0.054, 0.121, 0.172), vec3(0.282, 0.423, 0.448), luma);
+  return night + (rgb - luma) * vec3(0.28, 0.31, 0.39);
+}
+vec3 actorLight(vec3 rgb) {
+  vec3 cool = rgb * vec3(0.52, 0.64, 0.78) + vec3(0.032, 0.066, 0.101);
+  return mix(rgb, cool, uLighting.y);
+}
+float grassWind(vec2 p) {
+  vec2 wind = vec2(-uTime * 15.0, uTime * 4.5);
+  float broad = N(p + wind, 1320.0).b;
+  float streak = N(p * vec2(0.72, 1.5) + wind + vec2(231.0, 78.0), 890.0).g;
+  float wave = 0.5 + 0.5 * sin(uTime * 0.72 - dot(p, vec2(0.009, 0.005)));
+  return ss(0.31, 0.76, broad * 0.58 + streak * 0.24 + wave * 0.18);
+}
+
+// Short, tapered blades. Cluster density is sampled from the cached noise map;
+// a spatially coherent breeze bends their tips without moving their roots.
+vec2 grassInk(vec2 p) {
+  const vec2 G = vec2(10.0, 9.0);
   vec2 c0 = floor(p / G);
-  float ink = 0.0;
+  vec2 ink = vec2(0.0);
   for (int j = -1; j <= 1; j++) {
     vec2 c = c0 + vec2(0.0, float(j));
     vec2 cp = (c + 0.5) * G;
     float h = hash2(c + 3.1);
-    float dens = 0.75 * ss(0.42, 0.72, N(cp, 900.0).r) * ss(0.35, 0.6, N(cp + 50.0, 380.0).g) + 0.02;   // 一片片、一簇簇地画，中间留空
+    float clustered = N(cp + 97.0, 560.0).g;
+    float dens = 0.58 * ss(0.34, 0.71, clustered) + 0.055;
     if (h > dens) continue;
-    float ang = (N(cp, 1400.0).g - 0.5) * 0.7 + (hash2(c + 7.7) - 0.5) * 0.3;    // 以接近水平为主，一片里的线大致平行
-    float len = 2.5 + 3.0 * hash2(c + 1.9);                                      // 半长 2.5~5.5px
-    vec2 ctr = cp + (vec2(hash2(c + 4.3), hash2(c + 5.9)) - 0.5) * vec2(2.0, 3.0);
-    vec2 dir = vec2(cos(ang), sin(ang)) * len;
-    float d = segD(p, ctr - dir, ctr + dir);
-    ink = max(ink, (1.0 - ss(0.2, 0.9, d)) * (0.35 + 0.45 * hash2(c + 9.1)));
+    vec2 root = cp + (vec2(hash2(c + 4.3), hash2(c + 5.9)) - 0.5) * vec2(5.0, 5.0);
+    float len = 2.6 + 4.2 * hash2(c + 1.9);
+    float breeze = sin(uTime * 0.72 - dot(cp, vec2(0.009, 0.005)));
+    float gust = grassWind(cp);
+    float bend = (hash2(c + 7.7) - 0.3) * 2.0 + breeze * 0.65 + gust * 2.05;
+    vec2 mid = root + vec2(bend * 0.3, -len * 0.48);
+    vec2 tip = root + vec2(bend, -len);
+    float stem = 1.0 - ss(0.12, 0.8, segD(p, root, mid));
+    float end = 1.0 - ss(0.03, 0.6, segD(p, mid, tip));
+    float inkWeight = max(stem, end * 0.68);
+    ink.x = max(ink.x, inkWeight * (0.19 + 0.24 * hash2(c + 9.1)));
+    ink.y = max(ink.y, end * gust * ss(0.15, 0.53, hash2(c + 4.1)));
   }
   return ink;
 }
@@ -440,14 +466,34 @@ vec4 catColor(vec2 uv) {
 void main() {
   vec2 p = vec2(gl_FragCoord.x, uRes.y * uScale - gl_FragCoord.y) / uScale;
 
-  // ---------- 草地：黄绿和绿的大块水彩晕染，几片颜色深一点，左上（向阳）稍亮；纸的颗粒 ----------
-  float w1 = N(p, 1900.0).b, w2 = N(p + 311.0, 650.0).g;
-  vec3 col = mix(G_MID, G_LIGHT, ss(0.3, 0.75, w1 * 0.7 + w2 * 0.3));
-  col = mix(col, G_DEEP, ss(0.45, 0.85, N(p + 977.0, 1300.0).r) * 0.4);       // 阈值放宽：噪声放大很多倍，卡得太陡会出现台阶状的方块
-  col *= 1.0 + 0.05 * (0.5 - (p.x + p.y) / (uRes.x + uRes.y));
-  col *= 1.0 + (hash2(floor(p * (0.8 * max(uScale, 1.0)))) - 0.5) * 0.035;   // 颗粒按屏幕的实际像素取
-  // 画草的墨绿短线
-  col = mix(col, INK, grassInk(p) * 0.75);
+  // Broad watercolor washes and a restrained paper tooth; no visible grid.
+  float w1 = N(p, 2300.0).b, w2 = N(p + 311.0, 880.0).g;
+  vec3 col = mix(G_MID, G_LIGHT, ss(0.23, 0.78, w1 * 0.72 + w2 * 0.28));
+  col = mix(col, G_DEEP, ss(0.42, 0.86, N(p + 977.0, 1700.0).r) * 0.32);
+  float light = 0.5 - dot(p / uRes, vec2(0.43, 0.57));
+  col *= 1.0 + light * 0.055;
+  col += (N(p, 145.0).b - 0.5) * vec3(0.018, 0.017, 0.011);
+  col *= 1.0 + (hash2(floor(p * max(uScale, 1.0))) - 0.5) * 0.018;
+  // Smaller mossy washes lend depth without changing the icon field.
+  float clover = ss(0.46, 0.77, N(p + 581.0, 410.0).g) * ss(0.29, 0.68, N(p, 1860.0).r);
+  col = mix(col, vec3(0.38, 0.57, 0.37), clover * 0.26);
+  float windLight = grassWind(p);
+  col += windLight * vec3(0.054, 0.042, 0.016);
+  vec2 blades = grassInk(p);
+  col = mix(col, INK, blades.x * 0.72);
+  col = mix(col, vec3(0.84, 0.86, 0.60), blades.y * 0.37);
+  // Dew and long, low washes of moonlight over grass. The existing cloud
+  // silhouettes still catch and block this light as they drift.
+  if (uLighting.y > 0.001) {
+    float moonlit = ss(0.28, 0.76, 0.51 * w1 + 0.36 * w2 + 0.13 * windLight);
+    float groundFalloff = 0.85 + 0.23 * ss(0.05, 0.90, (p.x - p.y * 0.38) / uRes.x);
+    vec3 litGrass = meadowNight(col) * groundFalloff;
+    litGrass += (moonlit * 0.075 + blades.y * 0.075 * windLight) * vec3(0.57, 0.93, 1.0);
+    col = mix(col, litGrass, uLighting.y);
+  }
+  // Cached local sprite instances are composited before actors, cloud shadows and clouds.
+  vec4 extra = texture(uExtras, vec2(p.x / uRes.x, 1.0 - p.y / uRes.y));
+  col = col * (1.0 - extra.a) + extra.rgb;
 
 #ifdef MEADOW_ACTOR
   // 人物、风筝和完整投影都先落在草地上，随后由同一层云影和白云覆盖。
@@ -457,7 +503,7 @@ void main() {
   vec4 actor=texture(uActor,actorUV);
   float actorShadow=texture(uActorShadow,actorUV).r*inActor;
   col=mix(col,col*SHADOW,actorShadow*0.85);
-  col=mix(col,actor.rgb,actor.a*inActor);
+  col=mix(col,actorLight(actor.rgb),actor.a*inActor);
 #endif
 
 #ifdef MEADOW_CAT
@@ -469,22 +515,44 @@ void main() {
   float inCat=step(0.,catUV.x)*step(0.,catUV.y)*step(catUV.x,1.)*step(catUV.y,1.);
   float inShadow=step(0.,catShadowUV.x)*step(0.,catShadowUV.y)*step(catShadowUV.x,1.)*step(catShadowUV.y,1.);
   col=mix(col,col*SHADOW,catShadow*inShadow*.78);
-  col=mix(col,cat.rgb,cat.a*inCat);
+  col=mix(col,actorLight(cat.rgb),cat.a*inCat);
 #endif
 
-  // ---------- 云投在草地上的影子（右下方）：一整块深绿 ----------
-  float sd = cloudDist(p - SHADOW_OFF);
-  col = mix(col, col * SHADOW, ss(3.0, -3.0, sd) * 0.85);
+  // ---------- 高处云层的柔和半影 ----------
+  vec2 shadowOffset = mix(SHADOW_OFF * (1.0 + uLighting.x * 0.19), vec2(-89.0, 128.0), uLighting.y);
+  float sd = cloudDist(p - shadowOffset);
+  float penumbra = ss(31.0, -18.0, sd) * (0.64 + uLighting.x * 0.09 - uLighting.y * 0.16);
+  vec3 groundLight = mix(vec3(1.0), vec3(1.07, 0.89, 0.71), uLighting.x);
+  vec3 groundShadow = mix(mix(SHADOW, vec3(0.62, 0.71, 0.76), uLighting.x), vec3(0.67, 0.77, 0.91), uLighting.y);
+  col = col * mix(groundLight, groundShadow, penumbra);
 
   // ---------- 云：卡通画法（和大海主题一样）——一个个圆合起来，每个圆色调略有不同，
   //            只有朝光（左上）的外轮廓一道亮白，里面没有亮面；边缘干净 ----------
-  vec4 fc = vec4(0.0, -1e9, 0.0, 0.0);
-  float d = cloudDist(p, true, fc);
+  vec4 front, back;
+  float d = cloudDist(p, true, front, back);
   if (d < 1.5) {
     // 往光那边走一小段就出云了 → 这里是朝光的外沿（离外轮廓超过 21px 的地方不用算）
-    float hi = d > -21.0 ? ss(-1.0, 1.0, cloudDist(p + LIGHT * 20.0)) : 0.0;
-    vec3 cc = fc.y > -1e8 ? mix(CLOUD_BODY, CLOUD_SH, fc.w * 0.6) : mix(CLOUD_BODY, CLOUD_SH, 0.45);
-    cc = mix(cc, CLOUD_HI, hi);
+    vec2 edgeLight = mix(LIGHT, vec2(0.67, -0.74), uLighting.y);
+    float hi = d > -18.0 ? ss(-1.5, 6.5, cloudDist(p + edgeLight * 13.0)) : 0.0;
+    vec3 cc = mix(CLOUD_BODY, CLOUD_SH, 0.24);
+    if (back.z > 0.0) {
+      float wash = ss(0.0, max(4.0, back.z * 0.19), back.z - length(p - back.xy));
+      cc = mix(cc, cloudPaint(back, p, edgeLight), wash);
+    }
+    if (front.z > 0.0) {
+      float overlap = ss(0.0, max(5.0, front.z * 0.26), front.z - length(p - front.xy));
+      float order = back.z > 0.0 ? 0.5 + 0.5 * ss(0.0, 17.0, front.y - back.y) : 1.0;
+      cc = mix(cc, cloudPaint(front, p, edgeLight), overlap * order);
+    }
+    cc = mix(cc, CLOUD_HI, hi * 0.42);
+    // Broad washes sit above a much finer, matte paper tooth.
+    float pigment = (N(p + vec2(61.0, 117.0), 370.0).r - 0.5) * 0.025;
+    float tooth = (N(p * vec2(1.2, 0.68), 100.0).b - 0.5) * 0.017;
+    cc += vec3(0.82, 0.93, 1.0) * (pigment + tooth);
+    cc *= mix(vec3(1.0), mix(vec3(0.87, 0.82, 0.92), vec3(1.04, 0.95, 0.83), 0.58 + hi * 0.35), uLighting.x);
+    vec3 moonCloud = vec3(0.18, 0.251, 0.367) + (cc - 0.79) * vec3(0.69, 0.73, 0.77);
+    moonCloud += vec3(0.15, 0.20, 0.21) * hi;
+    cc = mix(cc, moonCloud, uLighting.y);
     col = mix(col, cc, ss(1.0, -1.0, d));
   }
   if (uDebug > 0.5) col = mix(col, vec3(0.9, 0.15, 0.15), 1.0 - ss(0.0, 1.5, abs(d)));
@@ -564,26 +632,43 @@ function uploadField(i, Fd) {
 const iconRects = () => icons.map(ic => ({ cx: ic.x + ic.w / 2, cy: ic.y + ic.h / 2, hw: ic.w / 2 - 4, hh: ic.h / 2 - 2 }));
 function commit(fromEmpty = false) {
   const nf = computeField(P.adaptive ? iconRects() : []);
+  if (!fromEmpty && nf === FB) return;
   const target = 1 - toI;
-  if (fromEmpty) { FA = computeField([]); uploadField(toI, FA); }
-  else FA = FB;
+  const growing = fromEmpty || !FB;
+  if (growing) {
+    FA = terrain.empty(P.sigma);
+    uploadField(toI, FA);
+  } else if (curMix < 1 && FA !== FB) {
+    // Start a new transition from the field that is actually on screen.
+    const old = FA.s, next = FB.s, s = new Float32Array(old.length);
+    for (let i = 0; i < s.length; i++) s[i] = old[i] + (next[i] - old[i]) * curMix;
+    FA = { s };
+    uploadField(toI, FA);
+  } else FA = FB;
   FB = nf;
   uploadField(target, FB);
   fromI = toI; toI = target;
   morphT0 = performance.now();
-  morphDur = fromEmpty ? 2600 : MORPH_MS;
+  morphDur = growing ? INTRO_MS : MORPH_MS;
+  curMix = 0;
 }
 function refresh() {
   FA = FB = computeField(P.adaptive ? iconRects() : []);
   uploadField(toI, FB);
-  fromI = toI; morphT0 = -1e9;
+  fromI = toI; morphT0 = -1e9; curMix = 1;
 }
 
 /* ======================================================================
    当前的场（图标挪动时在新旧两张之间过渡）
    ====================================================================== */
 let curMix = 1;
-const curS = (x, y) => FB ? sampleArr(FA.s, x, y) * (1 - curMix) + sampleArr(FB.s, x, y) * curMix : 999;
+function curS(x, y) {
+  if (!FB) return 999;
+  const next = sampleArr(FB.s, x, y);
+  if (curMix >= 1 || FA === FB) return next;
+  const old = sampleArr(FA.s, x, y);
+  return old + (next - old) * curMix;
+}
 
 /* ======================================================================
    云的圆：每帧在 CPU 上算好所有的圆（几百个），按格子分好上传成一张小纹理，着色器只读自己格子里的几个
@@ -591,12 +676,13 @@ const curS = (x, y) => FB ? sampleArr(FA.s, x, y) * (1 - curMix) + sampleArr(FB.
      → 边全是圆弧；圆的大小各自慢慢呼吸；图标挪动时跟着场平滑地长大 / 缩小
    - 天上的小云：一朵朵完整的云，由大小不一的圆组成（底下一排、上面堆几个，底部较平），整朵随风飘
    ====================================================================== */
-const CELL_G = 48, CIRC_K = 36;
+const CELL_G = 48, CIRC_K = 48, CLOUD_MARGIN = 38;
 let circStats = null, circTex = null, circBuf = null, cgW = 0, cgH = 0;
 const rnd1 = (x, y, k) => hash2(x, y, k);                  // 固定的随机数（和换种子一起变）
 const skyClouds = [];
 let flowT = 0;
-function makeSkyCloud(x) {
+function skyCloudY() { return 80 + Math.random() * Math.max(0, H - TASKBAR - 120); }
+function makeSkyCloud(x, y = skyCloudY()) {
   const rnd = Math.random, R = 95 * 1.2;                 // 轮廓大一些（云厚一些，才放得下大圆）；圆的大小还是按 95 算
   // 1) 大致的轮廓：底下一排大圆（中间大、两边小），上面再堆几个 → 底宽上窄的一团
   const n = 3 + Math.floor(rnd() * 3), w = R * (1.0 + n * 0.5);
@@ -642,7 +728,6 @@ function makeSkyCloud(x) {
   for (const [cx, cy, r] of body) if (r > 0.75 * Rm) circles.push([cx, cy, r - 0.75 * Rm, rnd()]);
   layer(34 * 0.85, [0.5, 0.9], -1.0 * Rm, ci => sstep(-0.05 * Rm, -0.35 * Rm, ci) * (1 - sstep(-0.7 * Rm, -1.0 * Rm, ci)), true);
   layer(24 * 0.85, [0.45, 0.8], -0.6 * Rm, ci => sstep(0, -0.2 * Rm, ci) * (1 - sstep(-0.4 * Rm, -0.6 * Rm, ci)), true);
-  const y = 80 + rnd() * (H - TASKBAR - 120);
   return { x, y, circles, v: 0.7 + rnd() * 0.6, grow: 0, hw: Math.max(-x0, x1) + 20 };
 }
 function stepSkyClouds(dt) {
@@ -652,13 +737,14 @@ function stepSkyClouds(dt) {
   const alive = skyClouds.filter(c => !c.dying);
   for (let i = want; i < alive.length; i++) alive[i].dying = true;
   for (let n = alive.length; n < want; n++) {
-    let best = null, bestD = -1;
+    let bestX = 0, bestY = 0, bestD = -1;
     for (let k = 0; k < 20; k++) {
-      const c = makeSkyCloud(Math.random() * W);
-      const dmin = Math.min(1e9, ...skyClouds.map(o => Math.hypot((o.x - c.x) / 1.6, o.y - c.y)));
-      if (dmin > bestD) { bestD = dmin; best = c; }
+      const x = Math.random() * W, y = skyCloudY();
+      let dmin = 1e9;
+      for (const cloud of skyClouds) dmin = Math.min(dmin, Math.hypot((cloud.x - x) / 1.6, cloud.y - y));
+      if (dmin > bestD) { bestD = dmin; bestX = x; bestY = y; }
     }
-    skyClouds.push(best);
+    skyClouds.push(makeSkyCloud(bestX, bestY));
   }
   for (let i = skyClouds.length - 1; i >= 0; i--) {
     const c = skyClouds[i];
@@ -670,7 +756,7 @@ function stepSkyClouds(dt) {
   }
 }
 const sstep = (a, b, x) => { const t = Math.min(Math.max((x - a) / (b - a), 0), 1); return t * t * (3 - 2 * t); };
-let massList = null, massT = -1e9;
+let massList = null, massField, massEdge, massSeed;
 function buildMassCircles() {
   const list = [];
   // 图标周围的云团：三层圆（大 / 小 / 很小），每层是一张固定的格子，每格随机放一个圆。
@@ -703,7 +789,7 @@ function buildMassCircles() {
       r *= sstep(5, 11, r);                                   // 太小的圆慢慢缩没，不留小点
       if (r < 0.5) continue;
       if (isBig) big.set(cx + ',' + cy, [x, y, r]);
-      list.push(x, y, r * (1 + 0.04 * Math.sin(flowT * (0.09 + 0.035 * ph) + ph * 6.283)), ph);
+      list.push(x, y, r, ph);
     }
   };
   // 大圆：圆心在云团里，越靠云边越小
@@ -718,7 +804,7 @@ function buildMassCircles() {
 // 相邻的圆大致朝同一个方向走（整团云在轻轻翻动），每个圆再带一点自己的小动作。只动位置、不动大小
 const wobX = (x, y, r, ph) => (4.5 + 0.12 * r) * (0.85 * Math.sin(flowT * 0.24 + x * 0.011 + y * 0.004) + 0.3 * Math.sin(flowT * 0.3 + ph * 6.283));
 const wobY = (x, y, r, ph) => (4.5 + 0.12 * r) * (0.65 * Math.sin(flowT * 0.2 + y * 0.013 - x * 0.006 + 1.7) + 0.25 * Math.cos(flowT * 0.28 + ph * 6.283));
-function uploadCircles(t) {
+function uploadCircles() {
   gl.activeTexture(gl.TEXTURE3);                            // 用第 3 号纹理单元，不要动到别的纹理
   const gw = Math.ceil(W / CELL_G) + 7, gh = Math.ceil(H / CELL_G) + 7;   // 左、上多 4 格（右下方的云影要用到画面外的云），右、下多 3 格
   if (!circTex || gw !== cgW || gh !== cgH) {
@@ -731,13 +817,19 @@ function uploadCircles(t) {
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
     circBuf = new Float32Array(gw * CIRC_K * gh * 4);
   }
-  // 图标周围云团的圆：只在图标挪动时（场在过渡）每帧重算，平时每 0.5 秒重算一次（呼吸很慢，看不出跳）
-  const morphing = curMix < 1 || !massList || massList.W !== W || massList.H !== H;
-  if (morphing || t - massT > 0.5) { massList = buildMassCircles(); massList.W = W; massList.H = H; massT = t; }
+  // Rebuild the base contours only when terrain changes, then animate the lobes continuously.
+  if (curMix < 1 || FB !== massField || P.edge !== massEdge || seed !== massSeed) {
+    massList = buildMassCircles();
+    // Cache only the settled layout. The last in-flight list is still slightly displaced.
+    massField = curMix >= 1 ? FB : null;
+    massEdge = P.edge;
+    massSeed = seed;
+  }
   const list = massList.slice();
   for (let i = 0; i < list.length; i += 4) {
     const x = list[i], y = list[i + 1], r = list[i + 2], ph = list[i + 3];
     list[i] = x + wobX(x, y, r, ph); list[i + 1] = y + wobY(x, y, r, ph);
+    list[i + 2] = r * (1 + 0.04 * Math.sin(flowT * (0.09 + 0.035 * ph) + ph * 6.283));
   }
   // 天上的小云
   for (const c of skyClouds) {
@@ -754,7 +846,8 @@ function uploadCircles(t) {
   for (let i = 0; i < list.length; i += 4) order.push(i);
   order.sort((a, b) => list[b + 2] - list[a + 2]);
   for (const i of order) {
-    const x = list[i], y = list[i + 1], r = list[i + 2] + 6;
+    // Include the whole soft shadow edge even in a neighbouring grid cell.
+    const x = list[i], y = list[i + 1], r = list[i + 2] + CLOUD_MARGIN;
     const x0 = Math.max(0, Math.floor((x - r) / CELL_G) + 4), x1 = Math.min(gw - 1, Math.floor((x + r) / CELL_G) + 4);
     const y0 = Math.max(0, Math.floor((y - r) / CELL_G) + 4), y1 = Math.min(gh - 1, Math.floor((y + r) / CELL_G) + 4);
     for (let gy = y0; gy <= y1; gy++) for (let gx = x0; gx <= x1; gx++) {
@@ -881,38 +974,54 @@ function applyLayout(kind) {
 /* ======================================================================
    尺寸 / 主循环
    ====================================================================== */
-function resize() {
-  W = innerWidth; H = innerHeight;
-  // 预览模式：页面按整块桌面的尺寸排版、再整体缩小显示，所以画布只需要很低的分辨率
-  const scale = PREVIEW ? 0.45 : Math.min(devicePixelRatio || 1, P.quality);
+let previewScale = 0.45;
+function resizeCanvas() {
+  // Keep the desktop layout in CSS pixels and match the visible preview's scale.
+  const scale = PREVIEW ? previewScale : Math.min(devicePixelRatio || 1, P.quality);
   // 按画布实际占的大小算（带小数：2560 宽的屏幕 150% 缩放是 1706.67，innerWidth 取整成 1707），
   // 不然画布比屏幕多出一个像素，浏览器会把整幅画缩放一下贴上去，又发糊
   const box = cv.getBoundingClientRect();
-  cv.width = Math.round((box.width || W) * scale); cv.height = Math.round((box.height || H) * scale); cv._scale = scale;
+  const width = Math.max(1, Math.round((box.width || W) * scale));
+  const height = Math.max(1, Math.round((box.height || H) * scale));
+  if (cv.width !== width) cv.width = width;
+  if (cv.height !== height) cv.height = height;
+  cv._scale = scale;
+}
+function resize() {
+  W = innerWidth; H = innerHeight;
+  resizeCanvas();
   Gw = Math.ceil(W / STEP) + 2; Gh = Math.ceil(H / STEP) + 2;
   buildNoise();
   allocField();
 }
 
 const T0 = performance.now();
-let lastT = 0, fpsEMA = 0, frameN = 0, frameMs = 0;
+const FRAME_INTERVAL = 1000 / 30;
+let lastT = 0, nextFrameAt = 0, lastDrawAt = 0, fpsEMA = 0, frameN = 0, frameMs = 0;
 const px = new Uint8Array(4);
 let paused = false;                              // 宿主通知：前台窗口最大化 / 全屏 → 暂停
 function frame(now) {
   requestAnimationFrame(frame);
-  if (paused) { lastT = 0; return; }
-  if (P.cap30 && now - lastT < 31) return;
-  const dt = lastT ? Math.min((now - lastT) / 1000, 0.1) : 0.03;
-  if (lastT) fpsEMA = fpsEMA ? fpsEMA * 0.9 + (1 / dt) * 0.1 : 1 / dt;
-  lastT = now;
-  const e = Math.min((now - morphT0) / morphDur, 1);
-  curMix = e < 0.5 ? 2 * e * e : 1 - Math.pow(-2 * e + 2, 2) / 2;
+  if (paused) { lastT = nextFrameAt = 0; return; }
+  const late = now - nextFrameAt;
+  if (P.cap30 && nextFrameAt && late < -0.8) return;
+  // Carry the fractional cadence across display refreshes without replaying missed frames.
+  nextFrameAt = P.cap30 ? (nextFrameAt && late < FRAME_INTERVAL ? nextFrameAt : now) + FRAME_INTERVAL : 0;
+  const elapsed = lastT ? Math.max(1, now - lastT) : FRAME_INTERVAL;
+  const dt = Math.min(elapsed / 1000, 0.1);
+  if (lastT) fpsEMA = fpsEMA ? fpsEMA * 0.9 + (1000 / elapsed) * 0.1 : 1000 / elapsed;
+  lastT = lastDrawAt = now;
+  const e = Math.max(0, Math.min((now - morphT0) / morphDur, 1));
+  curMix = 1 - (1 - e) * (1 - e);
   stepSkyClouds(dt);
   draw(now);
-  if (++frameN % 10 === 0) updateStats();
+  if (++frameN % 10 === 0 && !WALL && !PREVIEW) updateStats();
 }
 function draw(now) {
-  const measure = frameN % 20 === 0, t0 = performance.now();
+  const lighting = SceneElements.lighting(now, P.lighting);
+  const windTime = (now - T0) / 1000 * 0.72;
+  const windPhase = (x, y) => windTime - x * 0.009 - y * 0.005;
+  const t0 = performance.now();
   // 隐藏男孩时只保留路线状态，小猫仍能独立显示并避开男孩再次出现的路线。
   const boy=typeof prepareMeadowBoy==='function'?prepareMeadowBoy(now,P.showBoy===1):null;
   const actor=P.showBoy===1?boy:null;
@@ -920,7 +1029,9 @@ function draw(now) {
   // 官网不加载人物脚本，沿用原来的草地着色器和开销。
   if(actor&&!actorPR)actorPR=program(FS.replace('#version 300 es','#version 300 es\n#define MEADOW_ACTOR'));
   // 两次绘制共享本帧云数据，不额外重算、上传云团。
-  uploadCircles((now - T0) / 1000);
+  uploadCircles();
+  const extraLayer = SceneElements.render(gl, {theme:'meadow', now, width:W, height:H-TASKBAR, bottom:TASKBAR, scale:cv._scale, seed, field:curS, targetField:(x,y)=>FB?sampleArr(FB.s,x,y):999, fieldToken:FB, icons, params:P, lighting, windPhase, ownedPass:true,
+    avoid:[...(boy?.state?.position?[{...boy.state.position,radius:34}]:[]),...(cat?.state?[{x:cat.state.x,y:cat.state.y,radius:25}]:[])]}, true);
   const render=(renderer,withCat)=>{
     const { p, U } = renderer;
     gl.useProgram(p);
@@ -940,6 +1051,8 @@ function draw(now) {
     gl.activeTexture(gl.TEXTURE3); gl.bindTexture(gl.TEXTURE_2D, circTex); gl.uniform1i(U.uCirc, 3);
     gl.uniform2f(U.uCGrid, cgW, cgH); gl.uniform1f(U.uCellG, CELL_G);
     gl.uniform1f(U.uEdge, P.edge);
+    gl.uniform2f(U.uLighting, lighting.dusk, lighting.night);
+    gl.activeTexture(gl.TEXTURE7); gl.bindTexture(gl.TEXTURE_2D, extraLayer); gl.uniform1i(U.uExtras, 7);
     if(actor){
       gl.activeTexture(gl.TEXTURE5);gl.bindTexture(gl.TEXTURE_2D,actor.actor);gl.uniform1i(U.uActor,5);
       gl.activeTexture(gl.TEXTURE6);gl.bindTexture(gl.TEXTURE_2D,actor.shadow);gl.uniform1i(U.uActorShadow,6);
@@ -962,7 +1075,8 @@ function draw(now) {
     gl.enable(gl.SCISSOR_TEST);gl.scissor(left,cv.height-bottom,Math.max(0,right-left),Math.max(0,bottom-top));
     try{render(actor?catActorPR:catPR,true);}finally{gl.disable(gl.SCISSOR_TEST);}
   }
-  if (measure) { gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, px); frameMs = performance.now() - t0; }
+
+  frameMs = performance.now() - t0;
 }
 
 /* ======================================================================
@@ -978,7 +1092,7 @@ const GPU = (() => {
 function updateStats() {
   statsEl.innerHTML =
     `<span class="live">● 动画中 · ${fpsEMA.toFixed(0)} fps</span><br>GPU ${GPU}<br>` +
-    `单帧 ${frameMs.toFixed(1)} ms · 陆地场 ${fieldMs.toFixed(0)} ms<br>` +
+    `帧提交 ${frameMs.toFixed(1)} ms · 地形计算 ${fieldMs.toFixed(1)} ms<br>` +
     `画布 ${cv.width}×${cv.height} · 图标 ${icons.length}`;
 }
 function syncPanel() {
@@ -1083,17 +1197,21 @@ requestAnimationFrame(frame);
    ====================================================================== */
 // 应用设置：只接受面板上有的参数；云团大小要重算场
 function applySettings(v) {
+  v = SceneElements.normalize('meadow', v);
   if (typeof v.seed === 'number' && v.seed !== seed) reseed(v.seed);   // 设置窗口的"刷新"：换一张（桌面和预览用同一个种子）
   let field = false, adaptiveChanged = false;
   for (const k in v) {
     if ((!SLIDERS.some(s => s.key === k) && !DISPLAY_KEYS.includes(k)) || typeof v[k] !== typeof P[k] || P[k] === v[k]) continue;
+    if (k === 'lighting') {
+      if (v[k] === 0 || v[k] === 1 || v[k] === 2) P.lighting = v[k];
+      continue;
+    }
     if (DISPLAY_KEYS.includes(k) && v[k] !== 0 && v[k] !== 1) continue;
     P[k] = v[k];
     if (k === 'adaptive') adaptiveChanged = true;
     if (k === 'sigma') field = true;
   }
-  if (adaptiveChanged && FB) commit();
-  else if (field && FB) refresh();
+  if ((adaptiveChanged || field) && FB) commit();
 
 }
 
@@ -1111,10 +1229,23 @@ function startHostedMode() {
   icons = [];
   commit(true);                                   // 先是一片草地（还不知道图标在哪）
   let first = true;
+  const settlePaused = () => {
+    if (!paused || !iconsSeen) return;
+    curMix = 1; morphT0 = -1e9;
+    draw(lastDrawAt ||= performance.now());
+  };
   const handle = m => {
-    if (m.t === 'pause') { paused = PREVIEW ? false : m.v; return; }
-    if (m.t === 'settings') { applySettings(m.v || {}); return; }
-    if (m.t === 'reset') { applySettings(Object.assign({}, DEFAULTS, m.v || {})); return; }
+    if (m.t === 'pause') { if (!window.desklandRecording?.()) paused = PREVIEW ? false : m.v; settlePaused(); return; }
+    if (m.t === 'view' && PREVIEW && Number.isFinite(m.scale)) {
+      const scale = Math.max(0.24, Math.min(1.25, m.scale));
+      if (Math.abs(scale - previewScale) > 0.005) {
+        previewScale = scale;
+        resizeCanvas();
+      }
+      return;
+    }
+    if (m.t === 'settings') { applySettings(m.v || {}); settlePaused(); return; }
+    if (m.t === 'reset') { applySettings(Object.assign({}, DEFAULTS, m.v || {})); settlePaused(); return; }
     if (m.t !== 'icons') return;
     const k = window.devicePixelRatio || 1;       // 物理像素 → CSS 像素
     icons = m.vis ? m.r.map(([l, t, r, b]) => ({ x: l / k, y: t / k, w: (r - l) / k, h: (b - t) / k })) : [];
@@ -1122,6 +1253,7 @@ function startHostedMode() {
     iconsSeen = true;
     commit(first);                                // 第一次：云慢慢长出来；之后：云跟着图标平滑移动
     first = false;
+    settlePaused();
   };
   if (PREVIEW) {
     addEventListener('message', ev => { if (ev.source === parent) handle(typeof ev.data === 'string' ? JSON.parse(ev.data) : ev.data); });
@@ -1134,8 +1266,8 @@ function startHostedMode() {
   host.postMessage('ready');
 }
 </script>
-<script src="meadow-boy.js"></script>
-<script src="meadow-cat.js"></script>
-<script src="share.js"></script>   <!-- 分享图片 / 分享动画（示例图标、名字是色块） -->
+<script src="meadow-boy.js?v=0.3.5"></script>
+<script src="meadow-cat.js?v=0.3.5"></script>
+<script src="share.js?v=0.3.5"></script>   <!-- 分享图片 / 分享动画（示例图标、名字是色块） -->
 </body>
 </html>

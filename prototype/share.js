@@ -210,15 +210,19 @@
     ctx.fillStyle = '#fff'; ctx.fill(); ctx.lineWidth = 1.1; ctx.strokeStyle = '#111'; ctx.lineJoin = 'round'; ctx.stroke();
     ctx.restore();
   }
-  function pickMime() {
-    for (const t of ['video/mp4;codecs=avc1.640028', 'video/mp4;codecs=avc1', 'video/mp4', 'video/webm;codecs=vp9', 'video/webm'])
-      if (window.MediaRecorder && MediaRecorder.isTypeSupported(t)) return t;
-    return null;
+  function recordingFormats() {
+    if (!window.MediaRecorder) return [];
+    const supported = type => MediaRecorder.isTypeSupported(type);
+    return [
+      ['video/mp4;codecs=avc1.640028', 'video/mp4;codecs=avc1'].find(supported),
+      ['video/webm;codecs=vp9', 'video/webm;codecs=vp8'].find(supported),
+    ].filter(Boolean);
   }
   let busy = false;
+  window.desklandRecording = () => busy;
   // 颜色范围：浏览器录 H.264 时把画面按"全范围"（0~255）编码，只在 MP4 的 colr 里注明，码流里没写；
   // 很多播放器（还有聊天软件转码）只看码流，当成"有限范围"（16~235）来放，结果白的发白、整体变亮。
-  // 所以录之前先把颜色压进 16~235（SVG 滤镜，在 sRGB 里直接算），录完再把 colr 里的"全范围"标记改成"有限范围"：
+  // 录之前先把颜色压进 16~235（SVG 滤镜，在 sRGB 里直接算），重新封装时写入有限范围标记。
   // 码流、容器、画面三者一致，按哪种规矩放都对
   function limitedRangeFilter() {
     if (document.getElementById('deskland-limited-range')) return 'url(#deskland-limited-range)';
@@ -237,37 +241,41 @@
     fl.appendChild(ct); svg.appendChild(fl); document.body.appendChild(svg);
     return 'url(#deskland-limited-range)';
   }
-  // 把 MP4 里 colr（nclx）的"全范围"标记清掉（只在开头的 moov 里）
-  async function markLimitedRange(blob) {
-    const head = new Uint8Array(await blob.slice(0, 8192).arrayBuffer());
-    for (let i = 0; i + 15 < head.length; i++) {
-      if (head[i] === 0x63 && head[i + 1] === 0x6f && head[i + 2] === 0x6c && head[i + 3] === 0x72 &&       // 'colr'
-          head[i + 4] === 0x6e && head[i + 5] === 0x63 && head[i + 6] === 0x6c && head[i + 7] === 0x78) {  // 'nclx'
-        head[i + 14] &= 0x7f;                                // 原色(2) 传递(2) 矩阵(2) 之后那个字节的最高位 = 全范围
-        return new Blob([head, blob.slice(8192)], { type: blob.type });
-      }
-    }
-    return blob;
-  }
   // 录一段：返回 Promise<{ blob, mime, poster }>；onProgress(0..1)
   // 先等画面稳定：壁纸暂停着（比如设置窗口最大化了）就先放开跑一会儿，开场的树、房子没长好就等它长好（最多 6 秒）
-  function record(onProgress) {
-    const mime = pickMime();
-    if (!mime) return Promise.reject(new Error('这台电脑不支持录视频'));
-    if (busy) return Promise.reject(new Error('上一段还在录'));
+  async function record(onProgress) {
+    if (busy) throw new Error('上一段还在录');
+    const formats = recordingFormats();
+    if (!formats.length) throw new Error('这台电脑不支持录视频');
     busy = true;
     const wasPaused = typeof paused !== 'undefined' && paused;
     if (wasPaused) paused = false;
-    return new Promise(ok => {
-      const t0 = performance.now(), f0 = frameN;
-      const tick = () => {
-        const dt = performance.now() - t0, ran = frameN - f0;
-        if ((ran >= 10 && settled()) || dt > 6000 || (dt > 1000 && ran < 2)) ok(); else setTimeout(tick, 100);
-      };
-      if (!wasPaused && settled()) ok(); else tick();
-    }).then(() => recordNow(onProgress, mime, wasPaused));
+    try {
+      const { finalizeVideo } = await import('./video-export.mjs?v=0.3.2');
+      if (wasPaused || !settled()) await new Promise(ok => {
+        const t0 = performance.now(), f0 = frameN;
+        const tick = () => {
+          const dt = performance.now() - t0, ran = frameN - f0;
+          if ((ran >= 10 && settled()) || dt > 6000 || (dt > 1000 && ran < 2)) ok(); else setTimeout(tick, 100);
+        };
+        tick();
+      });
+      for (const mime of formats) {
+        try {
+          const { raw, poster, limitedRange } = await recordNow(onProgress, mime);
+          const blob = await finalizeVideo(raw, limitedRange);
+          return { blob, poster, mime: blob.type };
+        } catch (error) {
+          if (mime === formats[formats.length - 1] || error.name === 'AnimationTimeout') throw error;
+          console.warn('H.264 export failed; retrying as WebM:', error);
+        }
+      }
+    } finally {
+      if (typeof paused !== 'undefined') paused = hostPause === null ? wasPaused : hostPause;
+      busy = false;
+    }
   }
-  function recordNow(onProgress, mime, wasPaused) {
+  function recordNow(onProgress, mime) {
     // 画面大小：按屏幕比例，大约 200 万像素（宽高取偶数，H.264 要求）；网页视频可以用 window.__recMaxPixels 放宽
     const rs = Math.min(window.devicePixelRatio || 1, Math.sqrt((window.__recMaxPixels || 2.0e6) / (W * H)));
     const outW = Math.round(W * rs / 2) * 2, outH = Math.round(H * rs / 2) * 2;
@@ -278,7 +286,6 @@
     const saved = demo ? icons.map(ic => [ic, ic.x, ic.y]) : [];
     // 仅离线演示允许添加临时图标；普通分享保持空桌面。
     const temp = demo && !icons.length ? { x: W * 0.28, y: (H - TASKBAR) * 0.3, w: 76, h: 92 } : null;
-    if (temp) { icons.push(temp); commit(); }
     // 网页演示的编排（__recDemoStyle）：先单独拖"离屏幕中心最近的图标"（演示布局中间那个主角），
     // 再框选拖走左边一整片（演示布局两排共 5 个）——正好是"移动 1 个 / 移动多个"两种方式
     let moves = [];
@@ -304,30 +311,35 @@
     for (const m of moves) { m.t0 = tt; m.done = false; tt += m.kind === 'group' ? GDROP + GADAPT : DRAG + ADAPT; }
     const total = demo ? tt + HOLD1 : 12;
 
-    cv.width = outW; cv.height = outH; cv._scale = rs;
-    if (hasLabels && labelsReady()) renderLabels();
-    if (hasCache) cacheOK = false;
-    if (typeof paused !== 'undefined') paused = false;
     const comp = document.createElement('canvas');             // 先在这上面拼好一帧（画面 + 图标 + 指针）
     comp.width = outW; comp.height = outH;
     const ctx = comp.getContext('2d');
     const rec = document.createElement('canvas');               // 再把颜色压进 16~235 画到这上面，录的是这张
     rec.width = outW; rec.height = outH;
     const rctx = rec.getContext('2d');
-    const mp4 = mime.indexOf('mp4') >= 0 && !window.__recFullRange;
-    if (mp4) rctx.filter = limitedRangeFilter();
-    const stream = rec.captureStream(0), track = stream.getVideoTracks()[0];
-    const mr = new MediaRecorder(stream, { mimeType: mime, videoBitsPerSecond: window.__recBitrate || 8e6 });
+    const limitedRange = mime.startsWith('video/mp4') && !window.__recFullRange;
+    if (limitedRange) rctx.filter = limitedRangeFilter();
+    const manualFrames = typeof window.CanvasCaptureMediaStreamTrack?.prototype.requestFrame === 'function';
+    const stream = rec.captureStream(manualFrames ? 0 : 30);
+    const track = stream.getVideoTracks()[0];
+    let mr;
+    try {
+      mr = new MediaRecorder(stream, { mimeType: mime, videoBitsPerSecond: window.__recBitrate || 8e6 });
+    } catch (error) {
+      track.stop();
+      throw error;
+    }
     // 网页演示视频用全范围（window.__recFullRange）：颜色不压进 16~235，明艳不发灰；分享出去的仍压（聊天软件兼容）
     const chunks = [];
     mr.ondataavailable = e => { if (e.data && e.data.size) chunks.push(e.data); };
 
     return new Promise((resolve, reject) => {
       const origDraw = draw;
-      let t0 = null, lastProg = -1, finished = false, poster = null;
+      let t0 = null, lastProg = -1, finished = false, poster = null, timeout;
       const finish = err => {
         if (finished) return;
         finished = true;
+        clearTimeout(timeout);
         draw = origDraw;
         for (const [ic, x, y] of saved) { ic.x = x; ic.y = y; }
         if (temp) icons.splice(icons.indexOf(temp), 1);
@@ -335,20 +347,35 @@
         if (hasLabels && labelsReady()) renderLabels();
         if (hasCache) cacheOK = false;
         if (demo) commit();                                  // 仅演示编排需要恢复图标场
-        if (typeof paused !== 'undefined') paused = hostPause === null ? wasPaused : hostPause;
-        busy = false;
-        if (err) { try { mr.stop(); } catch (e) { } reject(err); return; }
+        if (err) { track.stop(); reject(err); return; }
+        const waitStop = setTimeout(() => {
+          track.stop();
+          reject(new Error('The video encoder did not finish.'));
+        }, 5000);
         mr.onstop = () => {
-          const blob = new Blob(chunks, { type: mime.split(';')[0] });
-          (mp4 ? markLimitedRange(blob) : Promise.resolve(blob)).then(b => resolve({ blob: b, mime: mime.split(';')[0], poster }));
+          clearTimeout(waitStop);
+          track.stop();
+          resolve({ raw: new Blob(chunks, { type: mime.split(';')[0] }), poster, limitedRange });
         };
-        mr.stop();
+        try { mr.stop(); }
+        catch (error) { clearTimeout(waitStop); track.stop(); reject(error); }
       };
+      mr.onerror = event => finish(event.error || new Error('The video encoder failed.'));
+      try {
+        if (temp) { icons.push(temp); commit(); }
+        cv.width = outW; cv.height = outH; cv._scale = rs;
+        if (hasLabels && labelsReady()) renderLabels();
+        if (hasCache) cacheOK = false;
+        if (typeof paused !== 'undefined') paused = false;
+      } catch (error) { finish(error); return; }
       // 主题每画好一帧（同一个任务里，画布还没被清掉）：拷过来，画上图标、指针，交给录像
       draw = function (now) {
         origDraw(now);
         if (finished) return;
-        if (t0 === null) { t0 = now; mr.start(); }
+        if (t0 === null) {
+          try { mr.start(); t0 = now; }
+          catch (error) { finish(error); return; }
+        }
         const t = (now - t0) / 1000;
         ctx.drawImage(cv, 0, 0, outW, outH);
         const disp = new Map();                              // 这一帧位置、样子和平时不一样的图标
@@ -410,12 +437,16 @@
         }
         if (cursor) drawCursor(ctx, cursor[0], cursor[1], rs, cursor[2]);
         rctx.drawImage(comp, 0, 0);
-        track.requestFrame();
+        if (manualFrames) track.requestFrame();
         const prog = Math.min(1, t / total);
         if (onProgress && prog - lastProg >= 0.05) { lastProg = prog; onProgress(prog); }
         if (t >= total) { poster = thumbOf(comp, 520); finish(null); }
       };
-      setTimeout(() => finish(new Error('画面没有动起来（壁纸可能被完全挡住了）')), (total + 8) * 1000);
+      timeout = setTimeout(() => {
+        const error = new Error('画面没有动起来（壁纸可能被完全挡住了）');
+        error.name = 'AnimationTimeout';
+        finish(error);
+      }, (total + 8) * 1000);
     });
   }
   window.desklandRecord = record;
